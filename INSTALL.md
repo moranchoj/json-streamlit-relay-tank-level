@@ -4,8 +4,7 @@
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/moranchoj/json-streamlit-relay-tank-level.git
-   cd json-streamlit-relay-tank-level
+      cd json-streamlit-relay-tank-level
    ```
 2. **Install dependencies**
    ```bash
