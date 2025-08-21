@@ -3,3 +3,5 @@ streamlit-autorefresh
 paho-mqtt
 RPi.GPIO
 gpiozero
+matplotlib
+pandas
