@@ -1,0 +1,111 @@
+# README - Gestió Centre Control Bomba
+
+## 1. Context
+Aquest projecte implementa un sistema de **control automàtic d’una bomba d’aigua** amb monitorització en temps real, gestió de maniobres i registre d’històrics.  
+El sistema combina **Venus OS GX Tank 140** per la lectura dels nivells de dipòsits, una **Raspberry Pi 4B** per la lògica de control i dashboard, i un **HAT PiRelay-V2** per al control físic dels relés.
+
+L’objectiu és automatitzar la maniobra de la bomba segons condicions dels nivells, horaris i manteniment, amb supervisió des d’un **dashboard web basat en Streamlit**.
+
+---
+
+## 2. Elements del sistema
+
+### Maquinari
+- **Venus OS 3.64** amb **GX Tank 140**.
+  - Port 3: sonda de nivell (4-20mA) del dipòsit baix.
+  - Port 4: sonda de nivell (4-20mA) del dipòsit alt.
+- **Raspberry Pi 4B** amb Raspberry Pi OS.
+- **HAT PiRelay-V2** de SB Components amb 4 relés.
+  - Relay 3 → GPIO6 (pin 31).
+  - Relay 4 → GPIO5 (pin 29).
+
+### Programari
+- **MQTT** activat al Venus OS (interfície v2 recomanada).
+- **Python 3** amb entorn virtual i llibreries:  
+  `streamlit`, `paho-mqtt`, `gpiozero`, `matplotlib`, etc.
+- **Streamlit** per al dashboard web.
+
+---
+
+## 3. Lògica del sistema
+
+1. **Arrencada programada**:  
+   - Per defecte a les **12:00** (configurable entre 11:00 i 14:00).  
+   - Activa els relés en funció dels nivells:  
+     - Relay 3 s’activa si el dipòsit baix està > 15%.  
+     - Relay 4 s’activa si el dipòsit alt està < 99%.  
+   - La maniobra dura màxim **3 minuts per defecte** (configurable entre 2 i 5).
+
+2. **Aturada automàtica**:  
+   - Passats els minuts de durada màxima.  
+   - O abans si el dipòsit baix cau < 15% o el dipòsit alt supera 99%.
+
+3. **Maniobra manual**:  
+   - Es pot activar des del dashboard amb un botó lliscant.  
+   - Durada màxima **10 minuts per defecte** (configurable entre 5 i 30).  
+   - Si supera aquest temps sense parada manual, s’atura automàticament.
+
+4. **Manteniment**:  
+   - Si no hi ha hagut cap maniobra amb arrencada en el període establert (10 dies per defecte, configurable entre 7 i 15), s’executa una maniobra de manteniment curta (5-15 segons).
+
+5. **Històric**:  
+   - Es guarda a un **fitxer CSV** (`historic.csv`) amb separador `;`.  
+   - Registra: dia/hora inici, final, durada, nivells inicials i finals, i tipus de maniobra (amb arrencada, sense arrencada, manteniment).  
+   - Retenció configurable (2 a 10 anys).
+
+6. **Notificació per correu**:  
+   - Al finalitzar la maniobra diària, s’envia un **email automàtic** amb el resultat i totes les dades.  
+   - El subject indica: *maniobra bomba amb arrencada*, *sense arrencada* o *manteniment*, seguit de la ubicació.  
+   - El cos conté totes les dades guardades al CSV.  
+   - Paràmetres configurables: correu destinatari, remitent i contrasenya SMTP.
+
+---
+
+## 4. Dashboard Streamlit
+
+El dashboard té **3 pestanyes**:
+
+### 🔹 Monitorització
+- Gauge del nivell del dipòsit alt (%).  
+- Gauge del nivell del dipòsit baix (%).  
+- Indicador LED (vermell/verd) estat de la maniobra (parada/en marxa).  
+- Indicadors LED dels relés 3 i 4.  
+- Hora i data actual.  
+- Hora i data de l’última maniobra i durada.  
+- Hora de la propera maniobra programada.  
+- Botó lliscant per maniobra manual.
+
+### 🔹 Històric
+- Gràfic amb 3 línies:  
+  - Durada diària de maniobra.  
+  - Nivell del dipòsit baix al començar.  
+  - Nivell del dipòsit alt al començar.  
+- Selector de període: 1 mes, 3 mesos, 6 mesos, 1 any, 3 anys, 5 anys, 10 anys (per defecte 1 any).  
+- Taula amb les dades dels darrers 30 dies.
+
+### 🔹 Paràmetres
+- Adreça IP broker MQTT.  
+- Hora maniobra (11:00–14:00, per defecte 12:00).  
+- Durada màxima maniobra (2–5 min, per defecte 3).  
+- Període arrencada manteniment (7–15 dies, per defecte 10).  
+- Temps maniobra manteniment (5–15 s, per defecte 10).  
+- Durada màxima maniobra manual (5–30 min, per defecte 10).  
+- Període retenció històric (2–10 anys, per defecte 5).  
+- Email destinatari.  
+- Email remitent i contrasenya SMTP.  
+- Ubicació del sistema.
+
+---
+
+## 5. Execució
+El sistema pot arrencar:  
+- Manualment amb `start_dashboard.sh`.  
+- Automàticament al boot mitjançant `autostart.service` i `install_autostart_service.sh`.
+
+Un script `test_mqtt.py` està inclòs per verificar la connexió MQTT i la recepció de nivells.
+
+---
+
+## 6. Accés
+Dashboard disponible a:  
+`http://<IP_RASPBERRY>:8501`
