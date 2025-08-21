@@ -2,6 +2,7 @@
   "mqtt_broker": "192.168.1.43",
   "mqtt_port": 1883,
   "mqtt_keepalive_s": 3,
+  "victron_device_id": "2ccf6734efd2",
   "hora_maniobra": "12:00",
   "durada_max_maniobra": 3,
   "durada_max_manual": 10,
