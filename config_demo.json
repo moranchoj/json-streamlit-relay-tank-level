@@ -1,0 +1,23 @@
+{
+  "mqtt_broker": "localhost",
+  "mqtt_port": 1883,
+  "mqtt_keepalive_s": 60,
+  "victron_device_id": "demo_device",
+  "hora_maniobra": "12:00",
+  "durada_max_maniobra": 3,
+  "durada_max_manual": 10,
+  "periode_manteniment": 10,
+  "temps_manteniment": 10,
+  "retencio_historic_anys": 5,
+  "relay3_gpio": 6,
+  "relay3_active_high": false,
+  "relay4_gpio": 5,
+  "relay4_active_high": false,
+  "email_enabled": false,
+  "email_smtp": "smtp.gmail.com",
+  "email_port": 465,
+  "email_user": "demo@demo.com",
+  "email_pass": "demo",
+  "email_to": "user@demo.com",
+  "ubicacio": "Demostració"
+}

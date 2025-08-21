@@ -302,6 +302,103 @@ class MQTTClient:
         """Comprova si la connexió MQTT està activa"""
         return st.session_state.get('mqtt_connected', False)
 
+class HistoryLogger:
+    """Gestor de l'històric d'operacions"""
+    
+    def __init__(self, config: ConfigManager):
+        self.config = config
+        self.csv_file = "historic.csv"
+        self._ensure_csv_exists()
+    
+    def _ensure_csv_exists(self):
+        """Assegura que el fitxer CSV existeixi amb capçaleres"""
+        if not os.path.exists(self.csv_file):
+            headers = [
+                "data_inici", "hora_inici", "data_final", "hora_final", 
+                "durada_segons", "nivell_baix_inici", "nivell_alt_inici",
+                "nivell_baix_final", "nivell_alt_final", "tipus_maniobra",
+                "motiu_aturada", "ubicacio"
+            ]
+            
+            try:
+                with open(self.csv_file, 'w', encoding='utf-8') as f:
+                    f.write(";".join(headers) + "\n")
+                logger.info("Fitxer històric CSV creat")
+            except Exception as e:
+                logger.error(f"Error creant fitxer CSV: {e}")
+    
+    def log_operation(self, start_time: datetime, end_time: datetime, 
+                     start_levels: Dict[str, float], end_levels: Dict[str, float],
+                     operation_type: str, stop_reason: str):
+        """Registra una operació a l'històric"""
+        try:
+            duration = (end_time - start_time).total_seconds()
+            ubicacio = self.config.get('ubicacio', 'N/A')
+            
+            record = [
+                start_time.strftime('%Y-%m-%d'),
+                start_time.strftime('%H:%M:%S'),
+                end_time.strftime('%Y-%m-%d'), 
+                end_time.strftime('%H:%M:%S'),
+                str(duration),
+                str(start_levels.get('low', 0)),
+                str(start_levels.get('high', 0)),
+                str(end_levels.get('low', 0)),
+                str(end_levels.get('high', 0)),
+                operation_type,
+                stop_reason,
+                ubicacio
+            ]
+            
+            with open(self.csv_file, 'a', encoding='utf-8') as f:
+                f.write(";".join(record) + "\n")
+            
+            logger.info(f"Operació registrada: {operation_type} - {duration:.1f}s")
+            
+        except Exception as e:
+            logger.error(f"Error registrant operació: {e}")
+    
+    def get_recent_history(self, days: int = 30) -> pd.DataFrame:
+        """Obté l'històric recent en format DataFrame"""
+        try:
+            if not os.path.exists(self.csv_file):
+                return pd.DataFrame()
+            
+            df = pd.read_csv(self.csv_file, sep=';', encoding='utf-8')
+            
+            # Filtrar per dies recents
+            if not df.empty:
+                df['datetime'] = pd.to_datetime(df['data_inici'] + ' ' + df['hora_inici'])
+                cutoff_date = datetime.now() - timedelta(days=days)
+                df = df[df['datetime'] >= cutoff_date]
+                df = df.sort_values('datetime', ascending=False)
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error llegint històric: {e}")
+            return pd.DataFrame()
+    
+    def cleanup_old_records(self):
+        """Neteja registres antics segons la configuració de retenció"""
+        try:
+            retention_years = self.config.get('retencio_historic_anys', 5)
+            cutoff_date = datetime.now() - timedelta(days=retention_years * 365)
+            
+            df = pd.read_csv(self.csv_file, sep=';', encoding='utf-8')
+            
+            if not df.empty:
+                df['datetime'] = pd.to_datetime(df['data_inici'] + ' ' + df['hora_inici'])
+                df_filtered = df[df['datetime'] >= cutoff_date]
+                
+                if len(df_filtered) < len(df):
+                    df_filtered.drop('datetime', axis=1).to_csv(self.csv_file, sep=';', index=False, encoding='utf-8')
+                    removed_count = len(df) - len(df_filtered)
+                    logger.info(f"Netejats {removed_count} registres antics de l'històric")
+                    
+        except Exception as e:
+            logger.error(f"Error netejant històric: {e}")
+
 class PumpController:
     """Controlador principal de la bomba"""
     
@@ -309,6 +406,7 @@ class PumpController:
         self.config = config
         self.relay_controller = relay_controller
         self.mqtt_client = mqtt_client
+        self.history_logger = HistoryLogger(config)
         
         # Inicialitzar estat de la bomba
         if 'pump_state' not in st.session_state:
@@ -317,8 +415,13 @@ class PumpController:
                 'mode': 'stopped',  # stopped, auto, manual, maintenance
                 'start_time': None,
                 'duration_limit': 0,
-                'last_operation': None
+                'last_operation': None,
+                'next_scheduled': None,
+                'auto_enabled': True
             }
+            
+        # Calcular propera maniobra programada
+        self._update_next_scheduled_time()
     
     def start_manual_operation(self):
         """Inicia maniobra manual"""
@@ -363,21 +466,34 @@ class PumpController:
                 self.relay_controller.set_relay_state(3, False)
                 self.relay_controller.set_relay_state(4, False)
                 
-                # Actualitzar estat
+                # Obtenir dades per l'històric
                 start_time = st.session_state.pump_state.get('start_time')
+                start_levels = st.session_state.pump_state.get('start_levels', {'low': 0, 'high': 0})
+                end_time = datetime.now()
+                end_levels = self.mqtt_client.get_tank_levels()
+                operation_mode = st.session_state.pump_state.get('mode', 'unknown')
+                
                 duration = 0
                 if start_time:
-                    duration = (datetime.now() - start_time).total_seconds()
+                    duration = (end_time - start_time).total_seconds()
+                    
+                    # Registrar a l'històric
+                    self.history_logger.log_operation(
+                        start_time, end_time, start_levels, end_levels,
+                        operation_mode, reason
+                    )
                 
+                # Actualitzar estat
                 st.session_state.pump_state.update({
                     'running': False,
                     'mode': 'stopped',
                     'start_time': None,
                     'duration_limit': 0,
                     'last_operation': {
-                        'end_time': datetime.now(),
+                        'end_time': end_time,
                         'duration': duration,
-                        'reason': reason
+                        'reason': reason,
+                        'mode': operation_mode
                     }
                 })
                 
@@ -444,6 +560,141 @@ class PumpController:
         """Actualitza l'estat del controlador (cridar periòdicament)"""
         if st.session_state.pump_state['running']:
             self._update_relays()
+        else:
+            # Comprovar si cal executar maniobra automàtica
+            self._check_scheduled_operation()
+    
+    def _update_next_scheduled_time(self):
+        """Actualitza l'hora de la propera maniobra programada"""
+        try:
+            hora_config = self.config.get('hora_maniobra', '12:00')
+            hour, minute = map(int, hora_config.split(':'))
+            
+            now = datetime.now()
+            scheduled_today = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            # Si ja ha passat l'hora d'avui, programar per demà
+            if scheduled_today <= now:
+                scheduled_next = scheduled_today + timedelta(days=1)
+            else:
+                scheduled_next = scheduled_today
+            
+            st.session_state.pump_state['next_scheduled'] = scheduled_next
+            logger.info(f"Propera maniobra programada: {scheduled_next.strftime('%Y-%m-%d %H:%M')}")
+            
+        except Exception as e:
+            logger.error(f"Error calculant propera maniobra: {e}")
+    
+    def _check_scheduled_operation(self):
+        """Comprova si cal executar la maniobra programada"""
+        try:
+            if not st.session_state.pump_state.get('auto_enabled', True):
+                return
+            
+            next_scheduled = st.session_state.pump_state.get('next_scheduled')
+            if not next_scheduled:
+                return
+            
+            now = datetime.now()
+            
+            # Comprovar si és hora de la maniobra (amb marge de 1 minut)
+            time_diff = abs((now - next_scheduled).total_seconds())
+            if time_diff <= 60:  # Dins del marge d'1 minut
+                logger.info("Iniciant maniobra automàtica programada")
+                self.start_auto_operation()
+                
+        except Exception as e:
+            logger.error(f"Error comprovant maniobra programada: {e}")
+    
+    def start_auto_operation(self):
+        """Inicia maniobra automàtica"""
+        try:
+            levels = self.mqtt_client.get_tank_levels()
+            
+            # Comprovar condicions per iniciar
+            if levels['low'] <= 15:
+                logger.warning("Maniobra automàtica cancel·lada: dipòsit baix ≤ 15%")
+                self._reschedule_operation()
+                return False
+            
+            if levels['high'] >= 99:
+                logger.warning("Maniobra automàtica cancel·lada: dipòsit alt ≥ 99%")
+                self._reschedule_operation()
+                return False
+            
+            # Configurar estat
+            duration_minutes = self.config.get('durada_max_maniobra', 3)
+            
+            st.session_state.pump_state.update({
+                'running': True,
+                'mode': 'auto',
+                'start_time': datetime.now(),
+                'duration_limit': duration_minutes * 60,  # convertir a segons
+                'start_levels': levels.copy()
+            })
+            
+            # Activar relés segons nivells
+            self._update_relays()
+            
+            # Programar propera maniobra
+            self._update_next_scheduled_time()
+            
+            logger.info(f"Maniobra automàtica iniciada (durada màx: {duration_minutes} min)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error iniciant maniobra automàtica: {e}")
+            return False
+    
+    def start_maintenance_operation(self):
+        """Inicia maniobra de manteniment"""
+        try:
+            levels = self.mqtt_client.get_tank_levels()
+            
+            # El manteniment és menys restrictiu en condicions
+            if levels['low'] <= 10:  # Límit més baix per manteniment
+                logger.warning("Maniobra manteniment cancel·lada: dipòsit baix ≤ 10%")
+                return False
+            
+            # Configurar estat
+            duration_seconds = self.config.get('temps_manteniment', 10)
+            
+            st.session_state.pump_state.update({
+                'running': True,
+                'mode': 'maintenance',
+                'start_time': datetime.now(),
+                'duration_limit': duration_seconds,  # ja en segons
+                'start_levels': levels.copy()
+            })
+            
+            # Activar tots els relés per manteniment
+            self.relay_controller.set_relay_state(3, True)
+            self.relay_controller.set_relay_state(4, True)
+            
+            logger.info(f"Maniobra manteniment iniciada (durada: {duration_seconds}s)")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error iniciant maniobra manteniment: {e}")
+            return False
+    
+    def _reschedule_operation(self):
+        """Reprograma la maniobra per demà"""
+        self._update_next_scheduled_time()
+        logger.info("Maniobra reprogramada per demà")
+    
+    def enable_auto_mode(self, enabled: bool):
+        """Activa/desactiva el mode automàtic"""
+        st.session_state.pump_state['auto_enabled'] = enabled
+        logger.info(f"Mode automàtic {'activat' if enabled else 'desactivat'}")
+    
+    def get_next_scheduled_time(self) -> Optional[datetime]:
+        """Obté l'hora de la propera maniobra programada"""
+        return st.session_state.pump_state.get('next_scheduled')
+    
+    def is_auto_enabled(self) -> bool:
+        """Comprova si el mode automàtic està activat"""
+        return st.session_state.pump_state.get('auto_enabled', True)
 
 # Funcions d'inicialització globals
 def initialize_session_state():
@@ -470,7 +721,8 @@ def get_system_controllers():
             'config': config,
             'relay': relay_controller,
             'mqtt': mqtt_client,
-            'pump': pump_controller
+            'pump': pump_controller,
+            'history': pump_controller.history_logger
         }
     
     return st.session_state.controllers
@@ -564,6 +816,34 @@ def render_monitoring_tab(controllers):
         else:
             st.write("🔴 **MQTT desconnectat**")
     
+    # Informació de programació automàtica
+    st.subheader("Programació Automàtica")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        auto_enabled = pump_controller.is_auto_enabled()
+        if st.checkbox("Mode automàtic activat", value=auto_enabled):
+            pump_controller.enable_auto_mode(True)
+        else:
+            pump_controller.enable_auto_mode(False)
+    
+    with col2:
+        next_scheduled = pump_controller.get_next_scheduled_time()
+        if next_scheduled:
+            st.write("**Propera maniobra:**")
+            st.write(next_scheduled.strftime('%d/%m/%Y %H:%M'))
+        else:
+            st.write("**Propera maniobra:** No programada")
+    
+    with col3:
+        if pump_state.get('last_operation'):
+            last_op = pump_state['last_operation']
+            st.write("**Última operació:**")
+            st.write(f"{last_op['end_time'].strftime('%d/%m/%Y %H:%M')}")
+            st.write(f"Durada: {last_op['duration']:.1f}s")
+            st.write(f"Motiu aturada: {last_op['reason']}")
+    
     # Estat dels relés
     st.subheader("Estat Relés")
     col1, col2 = st.columns(2)
@@ -581,7 +861,7 @@ def render_monitoring_tab(controllers):
     # Control manual
     st.subheader("Control Manual")
     
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     
     with col1:
         if not pump_state['running']:
@@ -596,23 +876,155 @@ def render_monitoring_tab(controllers):
                     st.rerun()
     
     with col2:
+        if not pump_state['running'] and auto_enabled:
+            if st.button("🔄 Forçar Maniobra Auto", type="secondary"):
+                if pump_controller.start_auto_operation():
+                    st.success("Maniobra automàtica forçada iniciada!")
+                    st.rerun()
+    
+    with col3:
+        if not pump_state['running']:
+            if st.button("🔧 Maniobra Manteniment", type="secondary"):
+                if pump_controller.start_maintenance_operation():
+                    st.success("Maniobra manteniment iniciada!")
+                    st.rerun()
+    
+    # Informació adicional
+    st.subheader("Informació del Sistema")
+    col1, col2 = st.columns(2)
+    
+    with col1:
         st.write(f"**Última actualització:** {last_update.strftime('%H:%M:%S')}")
-        if pump_state.get('last_operation'):
-            last_op = pump_state['last_operation']
-            st.write(f"**Última operació:** {last_op['end_time'].strftime('%H:%M:%S')}")
-            st.write(f"**Durada:** {last_op['duration']:.1f}s")
+        config = controllers['config']
+        st.write(f"**Hora programada:** {config.get('hora_maniobra', '12:00')}")
+        st.write(f"**Durada màx auto:** {config.get('durada_max_maniobra', 3)} min")
+        st.write(f"**Durada màx manual:** {config.get('durada_max_manual', 10)} min")
+    
+    with col2:
+        st.write(f"**Relay 3 GPIO:** {config.get('relay3_gpio', 6)} ({'Directa' if config.get('relay3_active_high', False) else 'Inversa'})")
+        st.write(f"**Relay 4 GPIO:** {config.get('relay4_gpio', 5)} ({'Directa' if config.get('relay4_active_high', False) else 'Inversa'})")
+        st.write(f"**MQTT Broker:** {config.get('mqtt_broker', 'N/A')}")
+        st.write(f"**Dispositiu Victron:** {config.get('victron_device_id', 'N/A')}")
 
 def render_history_tab(controllers):
     """Renderitza la pestanya d'històric"""
     st.header("Històric d'Operacions")
-    st.info("Funcionalitat d'històric en desenvolupament")
     
-    # Placeholder per gràfics i taules històriques
-    st.subheader("Gràfic de Tendències")
-    st.write("Aquí es mostraran els gràfics amb les tendències dels nivells i durades de maniobres")
+    history_logger = controllers['history']
     
-    st.subheader("Taula de Dades")
-    st.write("Aquí es mostrarà la taula amb les dades dels darrers 30 dies")
+    # Selector de període
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        period_options = {
+            "1 mes": 30,
+            "3 mesos": 90,
+            "6 mesos": 180,
+            "1 any": 365,
+            "3 anys": 1095,
+            "5 anys": 1825
+        }
+        
+        selected_period = st.selectbox(
+            "Període de visualització:",
+            options=list(period_options.keys()),
+            index=3  # Default: 1 any
+        )
+        
+        days = period_options[selected_period]
+    
+    with col2:
+        if st.button("🗑️ Neteja registres antics"):
+            history_logger.cleanup_old_records()
+            st.success("Registres antics netejats segons configuració de retenció")
+    
+    # Obtenir dades històriques
+    df = history_logger.get_recent_history(days)
+    
+    if df.empty:
+        st.info("No hi ha dades històriques disponibles per al període seleccionat")
+        return
+    
+    # Estadístiques generals
+    st.subheader("Resum del Període")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        total_operations = len(df)
+        st.metric("Total operacions", total_operations)
+    
+    with col2:
+        avg_duration = df['durada_segons'].mean()
+        st.metric("Durada mitjana", f"{avg_duration:.1f}s")
+    
+    with col3:
+        auto_operations = len(df[df['tipus_maniobra'] == 'auto'])
+        st.metric("Maniobres automàtiques", auto_operations)
+    
+    with col4:
+        manual_operations = len(df[df['tipus_maniobra'] == 'manual'])
+        st.metric("Maniobres manual", manual_operations)
+    
+    # Gràfic de durades
+    if len(df) > 1:
+        st.subheader("Evolució Temporal")
+        
+        # Preparar dades per al gràfic
+        df_plot = df.copy()
+        df_plot['data'] = pd.to_datetime(df_plot['data_inici'])
+        df_plot = df_plot.sort_values('data')
+        
+        # Crear gràfic amb Streamlit
+        chart_data = pd.DataFrame({
+            'Data': df_plot['data'],
+            'Durada (min)': df_plot['durada_segons'] / 60,
+            'Nivell Baix Inici (%)': df_plot['nivell_baix_inici'],
+            'Nivell Alt Inici (%)': df_plot['nivell_alt_inici']
+        })
+        
+        st.line_chart(chart_data.set_index('Data'))
+    
+    # Taula detallada
+    st.subheader("Detall d'Operacions (30 registres més recents)")
+    
+    # Preparar columnes per mostrar
+    display_columns = [
+        'data_inici', 'hora_inici', 'durada_segons', 
+        'nivell_baix_inici', 'nivell_alt_inici',
+        'tipus_maniobra', 'motiu_aturada'
+    ]
+    
+    if len(df) > 0:
+        df_display = df[display_columns].head(30).copy()
+        
+        # Formatjar columnes
+        df_display['durada_segons'] = df_display['durada_segons'].apply(lambda x: f"{x:.1f}s")
+        df_display['nivell_baix_inici'] = df_display['nivell_baix_inici'].apply(lambda x: f"{x:.1f}%")
+        df_display['nivell_alt_inici'] = df_display['nivell_alt_inici'].apply(lambda x: f"{x:.1f}%")
+        
+        # Renombrar columnes
+        df_display.columns = [
+            'Data', 'Hora', 'Durada', 'Nivell Baix (%)', 'Nivell Alt (%)',
+            'Tipus', 'Motiu Aturada'
+        ]
+        
+        st.dataframe(df_display, use_container_width=True)
+    
+    # Anàlisi per tipus de maniobra
+    if len(df) > 0:
+        st.subheader("Anàlisi per Tipus de Maniobra")
+        
+        analysis = df.groupby('tipus_maniobra').agg({
+            'durada_segons': ['count', 'mean', 'max'],
+            'nivell_baix_inici': 'mean',
+            'nivell_alt_inici': 'mean'
+        }).round(2)
+        
+        analysis.columns = ['Nombre', 'Durada Mitjana (s)', 'Durada Màxima (s)', 
+                           'Nivell Baix Mitjà (%)', 'Nivell Alt Mitjà (%)']
+        
+        st.dataframe(analysis, use_container_width=True)
 
 def render_parameters_tab(controllers):
     """Renderitza la pestanya de paràmetres"""
